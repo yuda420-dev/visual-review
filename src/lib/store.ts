@@ -2,10 +2,11 @@
 
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+import { idbStorage } from "./idb-storage";
 import type { Pin, ChatMessage } from "./types";
 
 interface ReviewState {
-  // Session-only
+  // Session-only (not persisted)
   htmlContent: string | null;
   blobUrl: string | null;
   fileName: string | null;
@@ -13,7 +14,7 @@ interface ReviewState {
   annotating: boolean;
   zoom: number;
 
-  // Persisted
+  // Persisted to IndexedDB
   pins: Pin[];
   messages: ChatMessage[];
   nextPinId: number;
@@ -30,6 +31,7 @@ interface ReviewState {
   setAnnotating: (v: boolean) => void;
   setZoom: (zoom: number) => void;
   clearAll: () => void;
+  getPinComments: (pinId: number) => string[];
   exportMarkdown: () => string;
   copyAllComments: () => string;
   buildClaudePrompt: (filePath: string) => string;
@@ -73,11 +75,8 @@ export const useReviewStore = create<ReviewState>()(
         });
       },
 
-      updatePinScreenshot: (id, screenshot) => {
-        set((s) => ({
-          pins: s.pins.map((p) => (p.id === id ? { ...p, screenshot } : p)),
-        }));
-      },
+      updatePinScreenshot: (id, screenshot) =>
+        set((s) => ({ pins: s.pins.map((p) => (p.id === id ? { ...p, screenshot } : p)) })),
 
       addMessage: (msg) => {
         const newMsg: ChatMessage = {
@@ -88,13 +87,12 @@ export const useReviewStore = create<ReviewState>()(
         set((s) => ({ messages: [...s.messages, newMsg] }));
       },
 
-      updateMessageScreenshot: (pinId, screenshot) => {
+      updateMessageScreenshot: (pinId, screenshot) =>
         set((s) => ({
           messages: s.messages.map((m) =>
             m.type === "pin" && m.pinId === pinId ? { ...m, screenshot } : m
           ),
-        }));
-      },
+        })),
 
       selectPin: (id) => set({ selectedPinId: id }),
       setAnnotating: (v) => set({ annotating: v }),
@@ -102,6 +100,20 @@ export const useReviewStore = create<ReviewState>()(
 
       clearAll: () =>
         set({ pins: [], messages: [], nextPinId: 1, selectedPinId: null }),
+
+      getPinComments: (pinId) => {
+        const { messages } = get();
+        const result: string[] = [];
+        let capturing = false;
+        for (const msg of messages) {
+          if (msg.type === "pin") {
+            capturing = msg.pinId === pinId;
+          } else if (msg.type === "user" && capturing) {
+            result.push(msg.content);
+          }
+        }
+        return result;
+      },
 
       exportMarkdown: () => {
         const { pins, messages, fileName } = get();
@@ -131,16 +143,13 @@ export const useReviewStore = create<ReviewState>()(
         return lines.join("\n");
       },
 
-      copyAllComments: () => {
-        return get()
+      copyAllComments: () =>
+        get()
           .messages.map((m) => (m.type === "pin" ? `[${m.content}]` : m.content))
-          .join("\n");
-      },
+          .join("\n"),
 
       buildClaudePrompt: (filePath) => {
         const { pins, messages, fileName } = get();
-
-        // Group user messages under their nearest preceding pin-ref message
         const groups: { pin: Pin; comments: string[] }[] = [];
         let currentPinId: number | null = null;
 
@@ -158,8 +167,7 @@ export const useReviewStore = create<ReviewState>()(
         const lines = [
           `You are reviewing the file: ${filePath || fileName || "the dashboard"}`,
           "",
-          "A designer/developer has placed visual annotation pins on the page and left feedback.",
-          "Each pin has a position (as % of viewport) and a label describing what element was clicked.",
+          "A reviewer has placed visual annotation pins on the page and left feedback.",
           "",
           "## Review Annotations",
           "",
@@ -172,7 +180,7 @@ export const useReviewStore = create<ReviewState>()(
             lines.push("Feedback:");
             for (const c of comments) lines.push(`  - ${c}`);
           } else {
-            lines.push("(no comment left — review this area generally)");
+            lines.push("(no comment — review this area generally)");
           }
           lines.push("");
         }
@@ -180,14 +188,13 @@ export const useReviewStore = create<ReviewState>()(
         if (filePath) {
           lines.push(
             "## Task",
-            `Please make all the changes described above directly to the file at: ${filePath}`,
-            "After editing, summarize what you changed for each pin."
+            `Make all the changes described above directly to: ${filePath}`,
+            "Summarize what you changed for each pin."
           );
         } else {
           lines.push(
             "## Task",
-            "Please suggest specific code changes for each annotation above.",
-            "Show the find/replace or diff for each change."
+            "Suggest specific code changes for each annotation. Show find/replace or diff for each."
           );
         }
 
@@ -195,9 +202,10 @@ export const useReviewStore = create<ReviewState>()(
       },
     }),
     {
-      name: "visual-review-storage",
-      storage: createJSONStorage(() => localStorage),
+      name: "visual-review-v1",
+      storage: createJSONStorage(() => idbStorage),
       partialize: (state) => ({
+        // Exclude screenshots — too large for storage
         pins: state.pins.map((p) => ({ ...p, screenshot: null })),
         messages: state.messages.map((m) => ({ ...m, screenshot: undefined })),
         nextPinId: state.nextPinId,

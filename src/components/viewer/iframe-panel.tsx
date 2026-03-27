@@ -104,6 +104,7 @@ export function IframePanel() {
 
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
   const [recentOpen, setRecentOpen] = useState(false);
+  const [hoverRect, setHoverRect] = useState<{ l: number; t: number; w: number; h: number } | null>(null);
 
   const blobUrl = useReviewStore((s) => s.blobUrl);
   const fileName = useReviewStore((s) => s.fileName);
@@ -489,7 +490,30 @@ export function IframePanel() {
               ref={overlayRef}
               className={`absolute inset-0 ${annotating ? "cursor-crosshair" : "pointer-events-none"}`}
               onClick={handleOverlayClick}
+              onMouseMove={annotating ? (e) => {
+                const rect = overlayRef.current!.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                try {
+                  const doc = iframeRef.current?.contentDocument;
+                  if (!doc) { setHoverRect(null); return; }
+                  const el = doc.elementFromPoint(x, y) as HTMLElement | null;
+                  if (!el || el === doc.documentElement || el === doc.body) { setHoverRect(null); return; }
+                  const er = el.getBoundingClientRect();
+                  // Skip elements that take up most of the viewport (containers/wrappers)
+                  if (er.width > rect.width * 0.9 || er.height > rect.height * 0.85) { setHoverRect(null); return; }
+                  setHoverRect({ l: er.left, t: er.top, w: er.width, h: er.height });
+                } catch { setHoverRect(null); }
+              } : undefined}
+              onMouseLeave={annotating ? () => setHoverRect(null) : undefined}
             >
+              {/* Hover highlight */}
+              {annotating && hoverRect && (
+                <div
+                  className="absolute pointer-events-none border-2 border-blue-400/80 bg-blue-400/10 rounded-sm z-10 transition-all duration-75"
+                  style={{ left: hoverRect.l, top: hoverRect.t, width: hoverRect.w, height: hoverRect.h }}
+                />
+              )}
               {pins.map((pin) => (
                 <PinMarker key={pin.id} pin={pin} onClick={handlePinClick} />
               ))}
