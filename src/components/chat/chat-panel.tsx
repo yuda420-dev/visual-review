@@ -32,6 +32,8 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
   const messages = useReviewStore((s) => s.messages);
   const pins = useReviewStore((s) => s.pins);
   const selectedPinId = useReviewStore((s) => s.selectedPinId);
+  const storeDirPath = useReviewStore((s) => s.dirPath);
+  const storeHtmlFile = useReviewStore((s) => s.htmlFile);
   const { addMessage, copyAllComments, exportMarkdown, clearAll, buildClaudePrompt, buildCLIPrompt } =
     useReviewStore();
 
@@ -97,12 +99,15 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
     setClaudeError("");
 
     const prompt = buildClaudePrompt(filePath.trim());
+    // Use typed path, fall back to store's server-mode path
+    const resolvedFilePath = filePath.trim() ||
+      (storeDirPath && storeHtmlFile ? `${storeDirPath}/${storeHtmlFile}` : "");
 
     try {
       const res = await fetch("/api/claude", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, allowEdit }),
+        body: JSON.stringify({ prompt, allowEdit, filePath: resolvedFilePath }),
       });
 
       if (!res.ok || !res.body) {

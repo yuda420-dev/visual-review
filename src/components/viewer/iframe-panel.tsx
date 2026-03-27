@@ -118,11 +118,12 @@ export function IframePanel() {
   const htmlFile = useReviewStore((s) => s.htmlFile);
   const autoReload = useReviewStore((s) => s.autoReload);
   const compareMode = useReviewStore((s) => s.compareMode);
+  const pendingAiPin = useReviewStore((s) => s.pendingAiPin);
 
   const {
     loadFile, addPin, addMessage, updatePinScreenshot, updateMessageScreenshot,
     selectPin, setAnnotating, setZoom, setDirPath, setHtmlFile,
-    setAutoReload, setCompareMode,
+    setAutoReload, setCompareMode, setPendingAiPin, addRawMessage, updateMessageContent,
   } = useReviewStore();
 
   // Keep blobUrlRef in sync for auto-reload cleanup
@@ -142,6 +143,40 @@ export function IframePanel() {
     setToast(msg);
     setTimeout(() => setToast(null), 3000);
   }, []);
+
+  // ── AI auto-scan ──────────────────────────────────────────────────────────
+
+  const autoScan = useCallback(async (dir: string, file: string) => {
+    const filePath = `${dir}/${file}`;
+    const prompt = `Analyze this dashboard (${file}). List all issues you can identify: empty sections, broken charts, inconsistent styling, missing data, layout problems, and anything that looks wrong. Number each issue. Be specific about which tab/section/element.`;
+    const msgId = `ai-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    addRawMessage({ id: msgId, type: "ai", content: "", timestamp: Date.now() });
+    try {
+      const res = await fetch("/api/claude", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, filePath }),
+      });
+      if (!res.ok || !res.body) {
+        updateMessageContent(msgId, "⚠️ Auto-scan failed — check that Claude Code is running.");
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulated = "";
+      let done = false;
+      while (!done) {
+        const { value, done: d } = await reader.read();
+        done = d;
+        if (value) {
+          accumulated += decoder.decode(value, { stream: !d });
+          updateMessageContent(msgId, accumulated);
+        }
+      }
+    } catch (err) {
+      updateMessageContent(msgId, `⚠️ Auto-scan error: ${String(err)}`);
+    }
+  }, [addRawMessage, updateMessageContent]);
 
   const revokeDepBlobs = useCallback(() => {
     depBlobsRef.current.forEach(URL.revokeObjectURL);
@@ -218,6 +253,7 @@ export function IframePanel() {
       loadFile(data.html, f, url);
       setDirPath(d);
       setHtmlFile(f);
+      autoScan(d, f); // fire-and-forget AI scan
     } catch (err) {
       setServerError(String(err));
     } finally {
@@ -307,9 +343,28 @@ export function IframePanel() {
       const scrollTop = iframe.contentWindow?.scrollY ?? 0;
       const scrollLeft = iframe.contentWindow?.scrollX ?? 0;
       const label = getLabelAtPoint(iframe, clickX, clickY);
+
+      // Pin-from-AI: skip category selector, use stored category + comment
+      if (pendingAiPin) {
+        const { category, comment } = pendingAiPin;
+        setPendingAiPin(null);
+        setAnnotating(false);
+        const meta = CAT_META[category];
+        const pinId = addPin({ xPct, yPct, scrollTop, scrollLeft, label, screenshot: null, category });
+        addMessage({ type: "pin", pinId, content: `${meta.emoji} Pin #${pinId} — ${label}`, screenshot: null });
+        addMessage({ type: "user", content: comment });
+        selectPin(pinId);
+        captureScreenshot(iframe, clickX, clickY).then((ss) => {
+          if (ss) { updatePinScreenshot(pinId, ss); updateMessageScreenshot(pinId, ss); }
+        });
+        return;
+      }
+
+      // Normal flow: show category selector
       setPendingClick({ screenX: e.clientX, screenY: e.clientY, clickX, clickY, xPct, yPct, label, scrollTop, scrollLeft });
     },
-    [annotating]
+    [annotating, pendingAiPin, setPendingAiPin, setAnnotating, addPin, addMessage,
+     updatePinScreenshot, updateMessageScreenshot, selectPin]
   );
 
   const handleCategorySelect = useCallback(
@@ -348,6 +403,7 @@ export function IframePanel() {
       const tag = document.activeElement?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
       if (e.key === "Escape") {
+        setPendingAiPin(null);
         setPendingClick(null);
         selectPin(null);
         setAnnotating(false);
@@ -633,12 +689,17 @@ export function IframePanel() {
               ))}
             </div>
 
-            {annotating && !pendingClick && (
+            {annotating && pendingAiPin && (
+              <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-violet-600/90 text-white text-xs px-3 py-1.5 rounded-full shadow-lg pointer-events-none z-30 max-w-[60%] text-center leading-snug">
+                {CAT_META[pendingAiPin.category].emoji} Click where to place — Esc to cancel
+              </div>
+            )}
+            {annotating && !pendingClick && !pendingAiPin && (
               <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-red-500/90 text-white text-xs px-3 py-1 rounded-full shadow-lg pointer-events-none z-30">
                 Click to place a pin — Esc to exit
               </div>
             )}
-            {annotating && pendingClick && (
+            {annotating && pendingClick && !pendingAiPin && (
               <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-card border border-border text-xs px-3 py-1 rounded-full shadow-lg pointer-events-none z-30 text-foreground">
                 Choose pin type…
               </div>

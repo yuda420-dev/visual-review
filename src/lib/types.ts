@@ -21,7 +21,7 @@ export interface Pin {
 
 export interface ChatMessage {
   id: string;
-  type: "pin" | "user";
+  type: "pin" | "user" | "ai";
   pinId?: number;
   content: string;
   screenshot?: string | null;

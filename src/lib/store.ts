@@ -17,6 +17,7 @@ interface ReviewState {
   compareMode: boolean;
   rightBlobUrl: string | null;
   rightFileName: string | null;
+  pendingAiPin: { category: PinCategory; comment: string } | null;
 
   // ── Persisted ─────────────────────────────────────────────────────────────
   pins: Pin[];
@@ -44,6 +45,9 @@ interface ReviewState {
   setCategoryFilter: (cats: PinCategory[]) => void;
   setCompareMode: (v: boolean) => void;
   loadRightFile: (blobUrl: string, fileName: string) => void;
+  setPendingAiPin: (v: { category: PinCategory; comment: string } | null) => void;
+  addRawMessage: (msg: ChatMessage) => void;
+  updateMessageContent: (id: string, content: string) => void;
   clearAll: () => void;
 
   // ── Derived / computed ────────────────────────────────────────────────────
@@ -68,6 +72,7 @@ export const useReviewStore = create<ReviewState>()(
       compareMode: false,
       rightBlobUrl: null,
       rightFileName: null,
+      pendingAiPin: null,
 
       // Persisted defaults
       pins: [],
@@ -136,6 +141,10 @@ export const useReviewStore = create<ReviewState>()(
       setCategoryFilter: (cats) => set({ categoryFilter: cats }),
       setCompareMode: (v) => set({ compareMode: v }),
       loadRightFile: (blobUrl, fileName) => set({ rightBlobUrl: blobUrl, rightFileName: fileName }),
+      setPendingAiPin: (v) => set({ pendingAiPin: v }),
+      addRawMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
+      updateMessageContent: (id, content) =>
+        set((s) => ({ messages: s.messages.map((m) => (m.id === id ? { ...m, content } : m)) })),
 
       clearAll: () =>
         set({ pins: [], messages: [], nextPinId: 1, selectedPinId: null }),
