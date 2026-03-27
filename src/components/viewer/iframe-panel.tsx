@@ -1,15 +1,20 @@
 "use client";
 
-import { useRef, useCallback, useEffect } from "react";
+import { useRef, useCallback, useEffect, useState } from "react";
 import { useReviewStore } from "@/lib/store";
+import { saveRecentFile, getRecentFiles, deleteRecentFile } from "@/lib/recent-files";
+import type { RecentFile } from "@/lib/recent-files";
 import { PinMarker } from "./pin-marker";
 import { PinList } from "./pin-list";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import type { Pin } from "@/lib/types";
-import { FolderOpen, Crosshair, ZoomIn, ZoomOut, Maximize, Folder } from "lucide-react";
+import {
+  FolderOpen, Crosshair, ZoomIn, ZoomOut, Maximize,
+  Folder, Clock, X, ChevronDown, AlertCircle,
+} from "lucide-react";
 
-// ── Screenshot helper ──────────────────────────────────────────────────────────
+// ── Screenshot ────────────────────────────────────────────────────────────────
 
 async function captureScreenshot(
   iframe: HTMLIFrameElement,
@@ -17,16 +22,16 @@ async function captureScreenshot(
   clickY: number
 ): Promise<string | null> {
   try {
-    const iframeDoc = iframe.contentDocument;
-    if (!iframeDoc) return null;
+    const doc = iframe.contentDocument;
+    if (!doc) return null;
     const html2canvas = (await import("html2canvas")).default;
-    const scrollX = iframe.contentWindow?.scrollX ?? 0;
-    const scrollY = iframe.contentWindow?.scrollY ?? 0;
-    const canvas = await html2canvas(iframeDoc.body, {
+    const sx = iframe.contentWindow?.scrollX ?? 0;
+    const sy = iframe.contentWindow?.scrollY ?? 0;
+    const canvas = await html2canvas(doc.body, {
       useCORS: true,
       allowTaint: true,
-      x: scrollX + clickX - 200,
-      y: scrollY + clickY - 150,
+      x: sx + clickX - 200,
+      y: sy + clickY - 150,
       width: 400,
       height: 300,
       logging: false,
@@ -37,59 +42,53 @@ async function captureScreenshot(
   }
 }
 
-// ── Label helper ──────────────────────────────────────────────────────────────
+// ── Element label ─────────────────────────────────────────────────────────────
 
 function getLabelAtPoint(iframe: HTMLIFrameElement, x: number, y: number): string {
   try {
-    const doc = iframe.contentDocument;
-    if (!doc) return "unknown area";
-    const el = doc.elementFromPoint(x, y) as HTMLElement | null;
-    if (!el) return "unknown area";
+    const el = iframe.contentDocument?.elementFromPoint(x, y) as HTMLElement | null;
+    if (!el) return "unknown";
     const text = el.textContent?.trim().replace(/\s+/g, " ").slice(0, 40);
     if (text) return text;
     const id = el.id ? `#${el.id}` : "";
     const cls = el.className
-      ? `.${String(el.className).split(" ").filter(Boolean)[0] || ""}`
+      ? `.${String(el.className).split(" ").filter(Boolean)[0] ?? ""}`
       : "";
     return `<${el.tagName.toLowerCase()}${id}${cls}>`;
   } catch {
-    return "unknown area";
+    return "unknown";
   }
 }
 
-// ── Folder loading helpers ────────────────────────────────────────────────────
+// ── Folder helpers ────────────────────────────────────────────────────────────
 
-function getMimeType(filename: string): string {
-  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
-  const map: Record<string, string> = {
-    js: "application/javascript",
-    mjs: "application/javascript",
-    css: "text/css",
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    gif: "image/gif",
-    svg: "image/svg+xml",
-    ico: "image/x-icon",
-    woff: "font/woff",
-    woff2: "font/woff2",
-    ttf: "font/ttf",
-    json: "application/json",
-    webp: "image/webp",
-  };
-  return map[ext] ?? "application/octet-stream";
+function getMimeType(name: string): string {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  return (
+    {
+      js: "application/javascript",
+      mjs: "application/javascript",
+      css: "text/css",
+      png: "image/png",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      gif: "image/gif",
+      svg: "image/svg+xml",
+      ico: "image/x-icon",
+      woff: "font/woff",
+      woff2: "font/woff2",
+      ttf: "font/ttf",
+      json: "application/json",
+      webp: "image/webp",
+    }[ext] ?? "application/octet-stream"
+  );
 }
 
-/**
- * Rewrites relative src/href in HTML to blob URLs from the fileMap.
- * Leaves absolute URLs (http/https/data/blob//) untouched.
- */
 function rewriteRelativeUrls(html: string, fileMap: Map<string, string>): string {
   return html.replace(/(\bsrc="|href=")([^"]+)(")/g, (match, pre, path, post) => {
     if (/^(https?:|\/\/|data:|blob:|#|\/)/.test(path)) return match;
-    // Try exact match first, then basename only
-    const blobUrl = fileMap.get(path) ?? fileMap.get(path.split("/").pop() ?? "");
-    return blobUrl ? `${pre}${blobUrl}${post}` : match;
+    const url = fileMap.get(path) ?? fileMap.get(path.split("/").pop() ?? "");
+    return url ? `${pre}${url}${post}` : match;
   });
 }
 
@@ -101,8 +100,10 @@ export function IframePanel() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  // Track dependency blob URLs so we can revoke them on reload
   const depBlobsRef = useRef<string[]>([]);
+
+  const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
+  const [recentOpen, setRecentOpen] = useState(false);
 
   const blobUrl = useReviewStore((s) => s.blobUrl);
   const fileName = useReviewStore((s) => s.fileName);
@@ -110,16 +111,40 @@ export function IframePanel() {
   const zoom = useReviewStore((s) => s.zoom);
   const annotating = useReviewStore((s) => s.annotating);
 
-  const { loadFile, addPin, addMessage, updatePinScreenshot, updateMessageScreenshot, selectPin, setAnnotating, setZoom } =
-    useReviewStore();
+  const {
+    loadFile,
+    addPin,
+    addMessage,
+    updatePinScreenshot,
+    updateMessageScreenshot,
+    selectPin,
+    setAnnotating,
+    setZoom,
+  } = useReviewStore();
 
-  // Revoke old dependency blobs before loading a new file
+  // Load recent files on mount
+  useEffect(() => {
+    getRecentFiles().then(setRecentFiles);
+  }, []);
+
   const revokeDepBlobs = useCallback(() => {
-    for (const url of depBlobsRef.current) URL.revokeObjectURL(url);
+    depBlobsRef.current.forEach(URL.revokeObjectURL);
     depBlobsRef.current = [];
   }, []);
 
-  // ── Single file picker ────────────────────────────────────────────────────
+  // ── Save + load helpers ───────────────────────────────────────────────────
+
+  const doLoad = useCallback(
+    async (htmlContent: string, name: string, finalBlobUrl: string, fromFolder: boolean) => {
+      loadFile(htmlContent, name, finalBlobUrl);
+      // Save to recent (use raw HTML, not blob URLs — those are session-only)
+      await saveRecentFile({ name, htmlContent, fromFolder, savedAt: Date.now() });
+      setRecentFiles(await getRecentFiles());
+    },
+    [loadFile]
+  );
+
+  // ── Single file ───────────────────────────────────────────────────────────
 
   const handleFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -131,17 +156,15 @@ export function IframePanel() {
         const content = ev.target?.result as string;
         const blob = new Blob([content], { type: "text/html" });
         const url = URL.createObjectURL(blob);
-        loadFile(content, file.name, url);
+        doLoad(content, file.name, url, false);
       };
       reader.readAsText(file);
       e.target.value = "";
     },
-    [loadFile, revokeDepBlobs]
+    [doLoad, revokeDepBlobs]
   );
 
-  // ── Folder picker ─────────────────────────────────────────────────────────
-  // Reads the entire folder, rewrites relative script/link/img src to blob URLs
-  // so that local JS files (like plotly-2.27.0.min.js) actually load.
+  // ── Folder ────────────────────────────────────────────────────────────────
 
   const handleFolderChange = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -149,49 +172,64 @@ export function IframePanel() {
       if (!files.length) return;
       e.target.value = "";
 
-      // Find the HTML file (prefer shallowest path depth, then first alphabetically)
-      const htmlFiles = files.filter((f) =>
-        /\.(html|htm)$/i.test(f.name)
-      );
-      if (!htmlFiles.length) {
-        alert("No .html file found in the selected folder.");
-        return;
-      }
+      const htmlFiles = files.filter((f) => /\.(html|htm)$/i.test(f.name));
+      if (!htmlFiles.length) { alert("No .html file found in folder."); return; }
+
+      // Pick shallowest (root-level) HTML file
       const htmlFile = htmlFiles.sort((a, b) => {
-        const depthA = (a.webkitRelativePath || a.name).split("/").length;
-        const depthB = (b.webkitRelativePath || b.name).split("/").length;
-        return depthA - depthB || a.name.localeCompare(b.name);
+        const da = (a.webkitRelativePath || a.name).split("/").length;
+        const db = (b.webkitRelativePath || b.name).split("/").length;
+        return da - db || a.name.localeCompare(b.name);
       })[0];
 
       revokeDepBlobs();
 
-      // Build blob URL map for every non-HTML file
+      // Build blob URL map for assets
       const fileMap = new Map<string, string>();
       await Promise.all(
         files
           .filter((f) => f !== htmlFile)
           .map(async (f) => {
             const buf = await f.arrayBuffer();
-            const blob = new Blob([buf], { type: getMimeType(f.name) });
-            const url = URL.createObjectURL(blob);
+            const url = URL.createObjectURL(
+              new Blob([buf], { type: getMimeType(f.name) })
+            );
             depBlobsRef.current.push(url);
-            // Register by filename and by relative path (minus the top-level folder)
             fileMap.set(f.name, url);
             const rel = (f.webkitRelativePath || f.name).split("/").slice(1).join("/");
             if (rel) fileMap.set(rel, url);
           })
       );
 
-      // Read HTML, rewrite relative refs, create final blob URL
       const rawHtml = await htmlFile.text();
-      const rewrittenHtml = rewriteRelativeUrls(rawHtml, fileMap);
-      const htmlBlob = new Blob([rewrittenHtml], { type: "text/html" });
+      const rewritten = rewriteRelativeUrls(rawHtml, fileMap);
+      const htmlBlob = new Blob([rewritten], { type: "text/html" });
       const htmlUrl = URL.createObjectURL(htmlBlob);
 
-      loadFile(rawHtml, htmlFile.name, htmlUrl);
+      doLoad(rawHtml, htmlFile.name, htmlUrl, true);
+    },
+    [doLoad, revokeDepBlobs]
+  );
+
+  // ── Reload from recent ────────────────────────────────────────────────────
+
+  const handleReloadRecent = useCallback(
+    (rf: RecentFile) => {
+      revokeDepBlobs();
+      setRecentOpen(false);
+      // If it came from a folder load, local scripts (Plotly etc.) won't be
+      // available without re-picking the folder. We load as-is (CDN scripts work).
+      const blob = new Blob([rf.htmlContent], { type: "text/html" });
+      const url = URL.createObjectURL(blob);
+      loadFile(rf.htmlContent, rf.name, url);
     },
     [loadFile, revokeDepBlobs]
   );
+
+  const handleDeleteRecent = useCallback(async (name: string) => {
+    await deleteRecentFile(name);
+    setRecentFiles(await getRecentFiles());
+  }, []);
 
   // ── Annotation ────────────────────────────────────────────────────────────
 
@@ -203,35 +241,34 @@ export function IframePanel() {
       const clickY = e.clientY - rect.top;
       const xPct = (clickX / rect.width) * 100;
       const yPct = (clickY / rect.height) * 100;
-
       const iframe = iframeRef.current;
       const scrollTop = iframe.contentWindow?.scrollY ?? 0;
       const scrollLeft = iframe.contentWindow?.scrollX ?? 0;
       const label = getLabelAtPoint(iframe, clickX, clickY);
 
-      // Add pin immediately (no screenshot yet) so the UI stays responsive
       const pinId = addPin({ xPct, yPct, scrollTop, scrollLeft, label, screenshot: null });
       addMessage({ type: "pin", pinId, content: `📍 Pin #${pinId} — ${label}`, screenshot: null });
       selectPin(pinId);
 
-      // Capture screenshot in background — update pin + message when done
-      captureScreenshot(iframe, clickX, clickY).then((screenshot) => {
-        if (screenshot) {
-          updatePinScreenshot(pinId, screenshot);
-          updateMessageScreenshot(pinId, screenshot);
+      // Screenshot in background — UI stays responsive
+      captureScreenshot(iframe, clickX, clickY).then((ss) => {
+        if (ss) {
+          updatePinScreenshot(pinId, ss);
+          updateMessageScreenshot(pinId, ss);
         }
       });
     },
-    [annotating, addPin, addMessage, selectPin]
+    [annotating, addPin, addMessage, updatePinScreenshot, updateMessageScreenshot, selectPin]
   );
 
   const handlePinClick = useCallback(
     (pin: Pin) => {
       selectPin(pin.id);
-      const iframe = iframeRef.current;
-      if (iframe?.contentWindow) {
-        iframe.contentWindow.scrollTo({ top: pin.scrollTop, left: pin.scrollLeft, behavior: "smooth" });
-      }
+      iframeRef.current?.contentWindow?.scrollTo({
+        top: pin.scrollTop,
+        left: pin.scrollLeft,
+        behavior: "smooth",
+      });
       if (containerRef.current) {
         const pinY = (pin.yPct / 100) * containerRef.current.clientHeight;
         containerRef.current.scrollTo({ top: pinY - 150, behavior: "smooth" });
@@ -240,13 +277,13 @@ export function IframePanel() {
     [selectPin]
   );
 
-  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+  // ── Keyboard ──────────────────────────────────────────────────────────────
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const tag = document.activeElement?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
-      if (e.key === "Escape") { selectPin(null); setAnnotating(false); }
+      if (e.key === "Escape") { selectPin(null); setAnnotating(false); setRecentOpen(false); }
       if (e.key === "a" || e.key === "A") setAnnotating(!annotating);
       const num = parseInt(e.key);
       if (!isNaN(num) && num >= 1) {
@@ -263,33 +300,94 @@ export function IframePanel() {
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-card flex-none flex-wrap">
-        {/* Single file */}
+      <div className="flex items-center gap-1.5 px-3 py-2 border-b border-border bg-card flex-none flex-wrap">
+        {/* Open folder (primary — needed for local scripts) */}
         <Button
-          variant="outline"
-          size="sm"
-          onClick={() => fileInputRef.current?.click()}
-          className="gap-1.5 text-xs h-7"
-          title="Open a single .html file (scripts that load local JS files may not work)"
-        >
-          <FolderOpen className="h-3.5 w-3.5" />
-          {fileName ? "Change File" : "Open HTML File"}
-        </Button>
-
-        {/* Folder picker — loads all files so relative scripts resolve */}
-        <Button
-          variant="secondary"
+          variant="default"
           size="sm"
           onClick={() => folderInputRef.current?.click()}
           className="gap-1.5 text-xs h-7"
-          title="Open the entire folder — rewrites relative script/CSS paths so local JS (Plotly, etc.) loads correctly"
+          title="Open the containing folder so local scripts (Plotly, etc.) load correctly"
         >
           <Folder className="h-3.5 w-3.5" />
           Open Folder
         </Button>
 
+        {/* Open single file */}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => fileInputRef.current?.click()}
+          className="gap-1.5 text-xs h-7"
+          title="Single .html file — works for CDN-only dashboards; local scripts won't load"
+        >
+          <FolderOpen className="h-3.5 w-3.5" />
+          File
+        </Button>
+
+        {/* Recent files dropdown */}
+        {recentFiles.length > 0 && (
+          <div className="relative">
+            <Button
+              variant="ghost"
+              size="sm"
+              className={`gap-1 text-xs h-7 ${recentOpen ? "bg-muted" : ""}`}
+              onClick={() => setRecentOpen((v) => !v)}
+              title="Recently opened files"
+            >
+              <Clock className="h-3.5 w-3.5" />
+              Recent
+              <ChevronDown className="h-3 w-3" />
+            </Button>
+
+            {recentOpen && (
+              <div className="absolute left-0 top-full mt-1 z-50 bg-card border border-border rounded-md shadow-xl min-w-[260px] max-w-[340px] overflow-hidden">
+                <div className="px-2 py-1.5 text-[10px] text-muted-foreground border-b border-border/50 font-medium uppercase tracking-wide">
+                  Recently opened
+                </div>
+                {recentFiles.map((rf) => (
+                  <div
+                    key={rf.name}
+                    className="flex items-center gap-2 px-2 py-1.5 hover:bg-muted/60 cursor-pointer group"
+                  >
+                    <span
+                      className="flex-1 text-xs truncate"
+                      onClick={() => handleReloadRecent(rf)}
+                      title={rf.name}
+                    >
+                      {rf.name}
+                    </span>
+                    {rf.fromFolder && (
+                      <span
+                        className="text-[9px] text-amber-500/70 flex-none"
+                        title="Was loaded from a folder — use Open Folder to get local scripts"
+                      >
+                        <AlertCircle className="h-3 w-3" />
+                      </span>
+                    )}
+                    <span className="text-[9px] text-muted-foreground/50 flex-none">
+                      {new Date(rf.savedAt).toLocaleDateString()}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-5 w-5 opacity-0 group-hover:opacity-100 flex-none"
+                      onClick={(e) => { e.stopPropagation(); handleDeleteRecent(rf.name); }}
+                    >
+                      <X className="h-3 w-3" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {fileName && (
-          <span className="text-xs text-muted-foreground truncate max-w-[180px]" title={fileName}>
+          <span
+            className="text-xs text-muted-foreground truncate max-w-[160px] ml-1"
+            title={fileName}
+          >
             {fileName}
           </span>
         )}
@@ -302,7 +400,10 @@ export function IframePanel() {
                 onClick={() => { const i = ZOOM_STEPS.indexOf(zoom); if (i > 0) setZoom(ZOOM_STEPS[i - 1]); }}
                 disabled={zoom <= ZOOM_STEPS[0]}
               ><ZoomOut className="h-3.5 w-3.5" /></Button>
-              <button className="text-xs text-muted-foreground w-10 text-center" onClick={() => setZoom(1)}>
+              <button
+                className="text-xs text-muted-foreground w-10 text-center"
+                onClick={() => setZoom(1)}
+              >
                 {Math.round(zoom * 100)}%
               </button>
               <Button
@@ -310,9 +411,10 @@ export function IframePanel() {
                 onClick={() => { const i = ZOOM_STEPS.indexOf(zoom); if (i < ZOOM_STEPS.length - 1) setZoom(ZOOM_STEPS[i + 1]); }}
                 disabled={zoom >= ZOOM_STEPS[ZOOM_STEPS.length - 1]}
               ><ZoomIn className="h-3.5 w-3.5" /></Button>
-              <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setZoom(1)} title="100%">
-                <Maximize className="h-3.5 w-3.5" />
-              </Button>
+              <Button
+                variant="ghost" size="icon" className="h-7 w-7"
+                onClick={() => setZoom(1)} title="100%"
+              ><Maximize className="h-3.5 w-3.5" /></Button>
             </div>
 
             <Button
@@ -328,40 +430,47 @@ export function IframePanel() {
 
             {pins.length > 0 && (
               <Badge variant="secondary" className="text-xs h-5 px-1.5">
-                {pins.length} pin{pins.length !== 1 ? "s" : ""}
+                {pins.length}
               </Badge>
             )}
           </>
         )}
 
-        {/* Hidden inputs */}
         <input ref={fileInputRef} type="file" accept=".html,.htm" className="hidden" onChange={handleFileChange} />
         <input
           ref={folderInputRef}
           type="file"
           className="hidden"
           onChange={handleFolderChange}
-          // @ts-expect-error — webkitdirectory is non-standard but universally supported
+          // @ts-expect-error — non-standard but universally supported
           webkitdirectory=""
           multiple
         />
       </div>
 
+      {/* Click outside to close recent dropdown */}
+      {recentOpen && (
+        <div className="fixed inset-0 z-40" onClick={() => setRecentOpen(false)} />
+      )}
+
       {/* Iframe area */}
       <div className="flex-1 overflow-auto bg-gray-950" ref={containerRef}>
         {!blobUrl ? (
           <div className="flex flex-col items-center justify-center h-full gap-4 text-muted-foreground">
-            <FolderOpen className="h-12 w-12 opacity-30" />
+            <Folder className="h-12 w-12 opacity-30" />
             <p className="text-sm text-center max-w-xs">
-              Use <strong>Open Folder</strong> to load a dashboard with local JS (Plotly, etc.),
-              or <strong>Open HTML File</strong> for self-contained pages.
+              Use <strong>Open Folder</strong> to load dashboards with local JS (Plotly, etc.)
+              <br />
+              <span className="text-xs opacity-60">
+                Use <strong>File</strong> for self-contained or CDN-only HTML
+              </span>
             </p>
             <div className="flex gap-2">
+              <Button variant="default" onClick={() => folderInputRef.current?.click()}>
+                <Folder className="h-4 w-4 mr-1.5" /> Open Folder
+              </Button>
               <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
                 <FolderOpen className="h-4 w-4 mr-1.5" /> Open File
-              </Button>
-              <Button variant="secondary" onClick={() => folderInputRef.current?.click()}>
-                <Folder className="h-4 w-4 mr-1.5" /> Open Folder
               </Button>
             </div>
           </div>
@@ -372,11 +481,10 @@ export function IframePanel() {
               src={blobUrl}
               className="w-full h-full border-none block"
               style={{ minHeight: 400 }}
-              sandbox="allow-scripts allow-same-origin"
+              sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads allow-popups"
               title="Review target"
             />
 
-            {/* Click overlay */}
             <div
               ref={overlayRef}
               className={`absolute inset-0 ${annotating ? "cursor-crosshair" : "pointer-events-none"}`}
@@ -396,11 +504,10 @@ export function IframePanel() {
         )}
       </div>
 
-      {/* Pin list */}
       {pins.length > 0 && (
         <div className="flex-none border-t border-border bg-card px-3 py-2 max-h-36 overflow-y-auto">
           <p className="text-xs text-muted-foreground mb-1 font-medium">
-            Pins — click to scroll there (keys 1-9)
+            Pins — click to jump (keys 1-9)
           </p>
           <PinList onPinClick={handlePinClick} />
         </div>
