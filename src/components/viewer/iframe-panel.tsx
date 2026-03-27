@@ -110,7 +110,7 @@ export function IframePanel() {
   const zoom = useReviewStore((s) => s.zoom);
   const annotating = useReviewStore((s) => s.annotating);
 
-  const { loadFile, addPin, addMessage, selectPin, setAnnotating, setZoom } =
+  const { loadFile, addPin, addMessage, updatePinScreenshot, updateMessageScreenshot, selectPin, setAnnotating, setZoom } =
     useReviewStore();
 
   // Revoke old dependency blobs before loading a new file
@@ -208,11 +208,19 @@ export function IframePanel() {
       const scrollTop = iframe.contentWindow?.scrollY ?? 0;
       const scrollLeft = iframe.contentWindow?.scrollX ?? 0;
       const label = getLabelAtPoint(iframe, clickX, clickY);
-      const screenshot = await captureScreenshot(iframe, clickX, clickY);
 
-      const pinId = addPin({ xPct, yPct, scrollTop, scrollLeft, label, screenshot });
-      addMessage({ type: "pin", pinId, content: `📍 Pin #${pinId} — ${label}`, screenshot });
+      // Add pin immediately (no screenshot yet) so the UI stays responsive
+      const pinId = addPin({ xPct, yPct, scrollTop, scrollLeft, label, screenshot: null });
+      addMessage({ type: "pin", pinId, content: `📍 Pin #${pinId} — ${label}`, screenshot: null });
       selectPin(pinId);
+
+      // Capture screenshot in background — update pin + message when done
+      captureScreenshot(iframe, clickX, clickY).then((screenshot) => {
+        if (screenshot) {
+          updatePinScreenshot(pinId, screenshot);
+          updateMessageScreenshot(pinId, screenshot);
+        }
+      });
     },
     [annotating, addPin, addMessage, selectPin]
   );
