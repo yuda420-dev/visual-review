@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { Pin } from "@/lib/types";
-import { Copy, Download, Trash2, Sparkles, X, ChevronUp, ChevronDown } from "lucide-react";
+import { Copy, Download, Trash2, Sparkles, X, ChevronUp, ChevronDown, Terminal } from "lucide-react";
 
 interface ChatPanelProps {
   onPinClick: (pin: Pin) => void;
@@ -16,8 +16,8 @@ interface ChatPanelProps {
 export function ChatPanel({ onPinClick }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [copied, setCopied] = useState(false);
+  const [promptCopied, setPromptCopied] = useState(false);
 
-  // Claude Code panel state
   const [claudeOpen, setClaudeOpen] = useState(false);
   const [filePath, setFilePath] = useState("");
   const [allowEdit, setAllowEdit] = useState(false);
@@ -32,7 +32,7 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
   const messages = useReviewStore((s) => s.messages);
   const pins = useReviewStore((s) => s.pins);
   const selectedPinId = useReviewStore((s) => s.selectedPinId);
-  const { addMessage, copyAllComments, exportMarkdown, clearAll, buildClaudePrompt } =
+  const { addMessage, copyAllComments, exportMarkdown, clearAll, buildClaudePrompt, buildCLIPrompt } =
     useReviewStore();
 
   useEffect(() => {
@@ -43,7 +43,6 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
     if (selectedPinId != null) inputRef.current?.focus();
   }, [selectedPinId]);
 
-  // Auto-scroll Claude response to bottom
   useEffect(() => {
     if (claudeScrollRef.current) {
       claudeScrollRef.current.scrollTop = claudeScrollRef.current.scrollHeight;
@@ -58,16 +57,20 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
   }, [input, addMessage]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      send();
-    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   };
 
   const handleCopy = () => {
     navigator.clipboard.writeText(copyAllComments()).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
+  const handleCopyPrompt = () => {
+    navigator.clipboard.writeText(buildCLIPrompt()).then(() => {
+      setPromptCopied(true);
+      setTimeout(() => setPromptCopied(false), 1500);
     });
   };
 
@@ -103,21 +106,17 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
       });
 
       if (!res.ok || !res.body) {
-        const text = await res.text();
-        setClaudeError(text || "Request failed");
+        setClaudeError(await res.text() || "Request failed");
         return;
       }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let done = false;
-
       while (!done) {
         const { value, done: d } = await reader.read();
         done = d;
-        if (value) {
-          setClaudeResponse((prev) => prev + decoder.decode(value, { stream: !d }));
-        }
+        if (value) setClaudeResponse((prev) => prev + decoder.decode(value, { stream: !d }));
       }
     } catch (err) {
       setClaudeError(String(err));
@@ -130,7 +129,6 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      {/* Slim header — title only */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-card flex-none">
         <span className="text-sm font-medium">Review Chat</span>
         {pins.length > 0 && (
@@ -140,7 +138,6 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
         )}
       </div>
 
-      {/* Messages */}
       <ScrollArea className="flex-1 px-3 min-h-0">
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-40 gap-2 text-muted-foreground">
@@ -158,7 +155,7 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
         )}
       </ScrollArea>
 
-      {/* Claude Code panel — slides up above the input */}
+      {/* Claude Code panel */}
       {claudeOpen && (
         <div className="flex-none border-t border-border bg-card flex flex-col max-h-[45%]">
           <div className="flex items-center gap-2 px-3 py-2 border-b border-border/50">
@@ -168,23 +165,16 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
               <X className="h-3 w-3" />
             </Button>
           </div>
-
-          {/* File path row */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-border/50">
             <input
               type="text"
               value={filePath}
               onChange={(e) => setFilePath(e.target.value)}
-              placeholder="/path/to/dashboard_v7.html  (leave blank for suggestions only)"
+              placeholder="/path/to/dashboard_v7.html  (blank = suggestions only)"
               className="flex-1 bg-background border border-input rounded px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-ring"
             />
             <label className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer flex-none">
-              <input
-                type="checkbox"
-                checked={allowEdit}
-                onChange={(e) => setAllowEdit(e.target.checked)}
-                className="rounded"
-              />
+              <input type="checkbox" checked={allowEdit} onChange={(e) => setAllowEdit(e.target.checked)} className="rounded" />
               Edit file
             </label>
             <Button
@@ -196,24 +186,15 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
               {claudeLoading ? "Running…" : "Run"}
             </Button>
           </div>
-
-          {/* Streaming response */}
-          <div
-            ref={claudeScrollRef}
-            className="flex-1 overflow-y-auto px-3 py-2 min-h-0"
-          >
-            {claudeError && (
-              <p className="text-xs text-destructive whitespace-pre-wrap">{claudeError}</p>
-            )}
+          <div ref={claudeScrollRef} className="flex-1 overflow-y-auto px-3 py-2 min-h-0">
+            {claudeError && <p className="text-xs text-destructive whitespace-pre-wrap">{claudeError}</p>}
             {claudeResponse ? (
               <pre className="text-xs text-foreground/90 whitespace-pre-wrap font-mono leading-relaxed">
                 {claudeResponse}
               </pre>
             ) : !claudeLoading ? (
               <p className="text-xs text-muted-foreground/50">
-                {pins.length === 0
-                  ? "Drop some pins first"
-                  : `${pins.length} pin${pins.length !== 1 ? "s" : ""} ready — press Run to send to your local Claude Code`}
+                {pins.length === 0 ? "Drop some pins first" : `${pins.length} pin${pins.length !== 1 ? "s" : ""} ready — press Run`}
               </p>
             ) : (
               <p className="text-xs text-muted-foreground animate-pulse">Claude is thinking…</p>
@@ -222,20 +203,32 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
         </div>
       )}
 
-      {/* Action bar — ALWAYS visible above input */}
-      <div className="flex-none border-t border-border bg-card px-3 pt-2 flex items-center gap-1">
+      {/* Action bar */}
+      <div className="flex-none border-t border-border bg-card px-3 pt-2 flex items-center gap-1 flex-wrap">
         <Button
-          variant="ghost"
-          size="sm"
+          variant="ghost" size="sm"
           className={`h-7 gap-1.5 text-xs ${claudeOpen ? "text-violet-400" : ""}`}
           onClick={() => setClaudeOpen((v) => !v)}
-          title="Send to Claude Code"
           disabled={pins.length === 0}
+          title="Send to Claude Code"
         >
           <Sparkles className="h-3.5 w-3.5" />
           Claude
           {claudeOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronUp className="h-3 w-3" />}
         </Button>
+
+        {hasContent && (
+          <Button
+            variant="ghost" size="sm"
+            className={`h-7 gap-1.5 text-xs ${promptCopied ? "text-green-400" : ""}`}
+            onClick={handleCopyPrompt}
+            title="Copy CLI-ready prompt to paste into Claude Code"
+            disabled={pins.length === 0}
+          >
+            <Terminal className="h-3.5 w-3.5" />
+            {promptCopied ? "Copied!" : "Copy Prompt"}
+          </Button>
+        )}
 
         <div className="flex-1" />
 
@@ -248,8 +241,7 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
               <Download className="h-3.5 w-3.5" />
             </Button>
             <Button
-              variant="ghost"
-              size="icon"
+              variant="ghost" size="icon"
               className="h-7 w-7 text-destructive/60 hover:text-destructive"
               onClick={() => { if (confirm("Clear all pins and comments?")) clearAll(); }}
               title="Clear all"
@@ -271,11 +263,7 @@ export function ChatPanel({ onPinClick }: ChatPanelProps) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={
-              selectedPinId != null
-                ? `Comment on Pin #${selectedPinId}… (Enter to send)`
-                : "Type a comment… (Enter to send)"
-            }
+            placeholder={selectedPinId != null ? `Comment on Pin #${selectedPinId}… (Enter)` : "Type a comment… (Enter to send)"}
             className="flex-1 min-h-[56px] max-h-28 resize-none text-sm bg-background"
             rows={2}
           />
