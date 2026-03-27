@@ -7,7 +7,9 @@ import { PinList } from "./pin-list";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import type { Pin } from "@/lib/types";
-import { FolderOpen, Crosshair, ZoomIn, ZoomOut, Maximize } from "lucide-react";
+import { FolderOpen, Crosshair, ZoomIn, ZoomOut, Maximize, Folder } from "lucide-react";
+
+// ── Screenshot helper ──────────────────────────────────────────────────────────
 
 async function captureScreenshot(
   iframe: HTMLIFrameElement,
@@ -35,6 +37,8 @@ async function captureScreenshot(
   }
 }
 
+// ── Label helper ──────────────────────────────────────────────────────────────
+
 function getLabelAtPoint(iframe: HTMLIFrameElement, x: number, y: number): string {
   try {
     const doc = iframe.contentDocument;
@@ -53,26 +57,75 @@ function getLabelAtPoint(iframe: HTMLIFrameElement, x: number, y: number): strin
   }
 }
 
+// ── Folder loading helpers ────────────────────────────────────────────────────
+
+function getMimeType(filename: string): string {
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+  const map: Record<string, string> = {
+    js: "application/javascript",
+    mjs: "application/javascript",
+    css: "text/css",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    svg: "image/svg+xml",
+    ico: "image/x-icon",
+    woff: "font/woff",
+    woff2: "font/woff2",
+    ttf: "font/ttf",
+    json: "application/json",
+    webp: "image/webp",
+  };
+  return map[ext] ?? "application/octet-stream";
+}
+
+/**
+ * Rewrites relative src/href in HTML to blob URLs from the fileMap.
+ * Leaves absolute URLs (http/https/data/blob//) untouched.
+ */
+function rewriteRelativeUrls(html: string, fileMap: Map<string, string>): string {
+  return html.replace(/(\bsrc="|href=")([^"]+)(")/g, (match, pre, path, post) => {
+    if (/^(https?:|\/\/|data:|blob:|#|\/)/.test(path)) return match;
+    // Try exact match first, then basename only
+    const blobUrl = fileMap.get(path) ?? fileMap.get(path.split("/").pop() ?? "");
+    return blobUrl ? `${pre}${blobUrl}${post}` : match;
+  });
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
 export function IframePanel() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  // Track dependency blob URLs so we can revoke them on reload
+  const depBlobsRef = useRef<string[]>([]);
 
   const blobUrl = useReviewStore((s) => s.blobUrl);
   const fileName = useReviewStore((s) => s.fileName);
   const pins = useReviewStore((s) => s.pins);
   const zoom = useReviewStore((s) => s.zoom);
   const annotating = useReviewStore((s) => s.annotating);
-  const selectedPinId = useReviewStore((s) => s.selectedPinId);
 
   const { loadFile, addPin, addMessage, selectPin, setAnnotating, setZoom } =
     useReviewStore();
+
+  // Revoke old dependency blobs before loading a new file
+  const revokeDepBlobs = useCallback(() => {
+    for (const url of depBlobsRef.current) URL.revokeObjectURL(url);
+    depBlobsRef.current = [];
+  }, []);
+
+  // ── Single file picker ────────────────────────────────────────────────────
 
   const handleFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
+      revokeDepBlobs();
       const reader = new FileReader();
       reader.onload = (ev) => {
         const content = ev.target?.result as string;
@@ -81,11 +134,66 @@ export function IframePanel() {
         loadFile(content, file.name, url);
       };
       reader.readAsText(file);
-      // Reset input so same file can be reloaded
       e.target.value = "";
     },
-    [loadFile]
+    [loadFile, revokeDepBlobs]
   );
+
+  // ── Folder picker ─────────────────────────────────────────────────────────
+  // Reads the entire folder, rewrites relative script/link/img src to blob URLs
+  // so that local JS files (like plotly-2.27.0.min.js) actually load.
+
+  const handleFolderChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(e.target.files ?? []);
+      if (!files.length) return;
+      e.target.value = "";
+
+      // Find the HTML file (prefer shallowest path depth, then first alphabetically)
+      const htmlFiles = files.filter((f) =>
+        /\.(html|htm)$/i.test(f.name)
+      );
+      if (!htmlFiles.length) {
+        alert("No .html file found in the selected folder.");
+        return;
+      }
+      const htmlFile = htmlFiles.sort((a, b) => {
+        const depthA = (a.webkitRelativePath || a.name).split("/").length;
+        const depthB = (b.webkitRelativePath || b.name).split("/").length;
+        return depthA - depthB || a.name.localeCompare(b.name);
+      })[0];
+
+      revokeDepBlobs();
+
+      // Build blob URL map for every non-HTML file
+      const fileMap = new Map<string, string>();
+      await Promise.all(
+        files
+          .filter((f) => f !== htmlFile)
+          .map(async (f) => {
+            const buf = await f.arrayBuffer();
+            const blob = new Blob([buf], { type: getMimeType(f.name) });
+            const url = URL.createObjectURL(blob);
+            depBlobsRef.current.push(url);
+            // Register by filename and by relative path (minus the top-level folder)
+            fileMap.set(f.name, url);
+            const rel = (f.webkitRelativePath || f.name).split("/").slice(1).join("/");
+            if (rel) fileMap.set(rel, url);
+          })
+      );
+
+      // Read HTML, rewrite relative refs, create final blob URL
+      const rawHtml = await htmlFile.text();
+      const rewrittenHtml = rewriteRelativeUrls(rawHtml, fileMap);
+      const htmlBlob = new Blob([rewrittenHtml], { type: "text/html" });
+      const htmlUrl = URL.createObjectURL(htmlBlob);
+
+      loadFile(rawHtml, htmlFile.name, htmlUrl);
+    },
+    [loadFile, revokeDepBlobs]
+  );
+
+  // ── Annotation ────────────────────────────────────────────────────────────
 
   const handleOverlayClick = useCallback(
     async (e: React.MouseEvent<HTMLDivElement>) => {
@@ -100,18 +208,10 @@ export function IframePanel() {
       const scrollTop = iframe.contentWindow?.scrollY ?? 0;
       const scrollLeft = iframe.contentWindow?.scrollX ?? 0;
       const label = getLabelAtPoint(iframe, clickX, clickY);
-
       const screenshot = await captureScreenshot(iframe, clickX, clickY);
 
       const pinId = addPin({ xPct, yPct, scrollTop, scrollLeft, label, screenshot });
-
-      addMessage({
-        type: "pin",
-        pinId,
-        content: `📍 Pin #${pinId} — ${label}`,
-        screenshot,
-      });
-
+      addMessage({ type: "pin", pinId, content: `📍 Pin #${pinId} — ${label}`, screenshot });
       selectPin(pinId);
     },
     [annotating, addPin, addMessage, selectPin]
@@ -120,16 +220,10 @@ export function IframePanel() {
   const handlePinClick = useCallback(
     (pin: Pin) => {
       selectPin(pin.id);
-      // Scroll iframe to pin's original scroll position
       const iframe = iframeRef.current;
       if (iframe?.contentWindow) {
-        iframe.contentWindow.scrollTo({
-          top: pin.scrollTop,
-          left: pin.scrollLeft,
-          behavior: "smooth",
-        });
+        iframe.contentWindow.scrollTo({ top: pin.scrollTop, left: pin.scrollLeft, behavior: "smooth" });
       }
-      // Scroll pin into view in container
       if (containerRef.current) {
         const pinY = (pin.yPct / 100) * containerRef.current.clientHeight;
         containerRef.current.scrollTo({ top: pinY - 150, behavior: "smooth" });
@@ -138,21 +232,14 @@ export function IframePanel() {
     [selectPin]
   );
 
-  // Keyboard: Escape deselects, numbers jump to pins
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        selectPin(null);
-        setAnnotating(false);
-      }
-      if (e.key === "a" || e.key === "A") {
-        if (
-          document.activeElement?.tagName !== "INPUT" &&
-          document.activeElement?.tagName !== "TEXTAREA"
-        ) {
-          setAnnotating(!annotating);
-        }
-      }
+      const tag = document.activeElement?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "Escape") { selectPin(null); setAnnotating(false); }
+      if (e.key === "a" || e.key === "A") setAnnotating(!annotating);
       const num = parseInt(e.key);
       if (!isNaN(num) && num >= 1) {
         const pin = pins.find((p) => p.id === num);
@@ -168,15 +255,29 @@ export function IframePanel() {
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-card flex-none">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-card flex-none flex-wrap">
+        {/* Single file */}
         <Button
           variant="outline"
           size="sm"
           onClick={() => fileInputRef.current?.click()}
           className="gap-1.5 text-xs h-7"
+          title="Open a single .html file (scripts that load local JS files may not work)"
         >
           <FolderOpen className="h-3.5 w-3.5" />
           {fileName ? "Change File" : "Open HTML File"}
+        </Button>
+
+        {/* Folder picker — loads all files so relative scripts resolve */}
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => folderInputRef.current?.click()}
+          className="gap-1.5 text-xs h-7"
+          title="Open the entire folder — rewrites relative script/CSS paths so local JS (Plotly, etc.) loads correctly"
+        >
+          <Folder className="h-3.5 w-3.5" />
+          Open Folder
         </Button>
 
         {fileName && (
@@ -188,49 +289,24 @@ export function IframePanel() {
         {blobUrl && (
           <>
             <div className="ml-auto flex items-center gap-1">
-              {/* Zoom */}
               <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => {
-                  const idx = ZOOM_STEPS.indexOf(zoom);
-                  if (idx > 0) setZoom(ZOOM_STEPS[idx - 1]);
-                }}
+                variant="ghost" size="icon" className="h-7 w-7"
+                onClick={() => { const i = ZOOM_STEPS.indexOf(zoom); if (i > 0) setZoom(ZOOM_STEPS[i - 1]); }}
                 disabled={zoom <= ZOOM_STEPS[0]}
-              >
-                <ZoomOut className="h-3.5 w-3.5" />
-              </Button>
-              <button
-                className="text-xs text-muted-foreground w-10 text-center"
-                onClick={() => setZoom(1)}
-              >
+              ><ZoomOut className="h-3.5 w-3.5" /></Button>
+              <button className="text-xs text-muted-foreground w-10 text-center" onClick={() => setZoom(1)}>
                 {Math.round(zoom * 100)}%
               </button>
               <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => {
-                  const idx = ZOOM_STEPS.indexOf(zoom);
-                  if (idx < ZOOM_STEPS.length - 1) setZoom(ZOOM_STEPS[idx + 1]);
-                }}
+                variant="ghost" size="icon" className="h-7 w-7"
+                onClick={() => { const i = ZOOM_STEPS.indexOf(zoom); if (i < ZOOM_STEPS.length - 1) setZoom(ZOOM_STEPS[i + 1]); }}
                 disabled={zoom >= ZOOM_STEPS[ZOOM_STEPS.length - 1]}
-              >
-                <ZoomIn className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => setZoom(1)}
-                title="Fit (100%)"
-              >
+              ><ZoomIn className="h-3.5 w-3.5" /></Button>
+              <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setZoom(1)} title="100%">
                 <Maximize className="h-3.5 w-3.5" />
               </Button>
             </div>
 
-            {/* Annotate toggle */}
             <Button
               variant={annotating ? "default" : "outline"}
               size="sm"
@@ -250,12 +326,16 @@ export function IframePanel() {
           </>
         )}
 
+        {/* Hidden inputs */}
+        <input ref={fileInputRef} type="file" accept=".html,.htm" className="hidden" onChange={handleFileChange} />
         <input
-          ref={fileInputRef}
+          ref={folderInputRef}
           type="file"
-          accept=".html,.htm"
           className="hidden"
-          onChange={handleFileChange}
+          onChange={handleFolderChange}
+          // @ts-expect-error — webkitdirectory is non-standard but universally supported
+          webkitdirectory=""
+          multiple
         />
       </div>
 
@@ -264,16 +344,21 @@ export function IframePanel() {
         {!blobUrl ? (
           <div className="flex flex-col items-center justify-center h-full gap-4 text-muted-foreground">
             <FolderOpen className="h-12 w-12 opacity-30" />
-            <p className="text-sm">Open an HTML file to start reviewing</p>
-            <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
-              Choose File
-            </Button>
+            <p className="text-sm text-center max-w-xs">
+              Use <strong>Open Folder</strong> to load a dashboard with local JS (Plotly, etc.),
+              or <strong>Open HTML File</strong> for self-contained pages.
+            </p>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
+                <FolderOpen className="h-4 w-4 mr-1.5" /> Open File
+              </Button>
+              <Button variant="secondary" onClick={() => folderInputRef.current?.click()}>
+                <Folder className="h-4 w-4 mr-1.5" /> Open Folder
+              </Button>
+            </div>
           </div>
         ) : (
-          <div
-            className="relative h-full"
-            style={{ width: `${zoom * 100}%`, minWidth: "100%" }}
-          >
+          <div className="relative h-full" style={{ width: `${zoom * 100}%`, minWidth: "100%" }}>
             <iframe
               ref={iframeRef}
               src={blobUrl}
@@ -286,20 +371,14 @@ export function IframePanel() {
             {/* Click overlay */}
             <div
               ref={overlayRef}
-              className={`absolute inset-0 ${
-                annotating
-                  ? "cursor-crosshair bg-transparent"
-                  : "pointer-events-none"
-              }`}
+              className={`absolute inset-0 ${annotating ? "cursor-crosshair" : "pointer-events-none"}`}
               onClick={handleOverlayClick}
             >
-              {/* Pin markers */}
               {pins.map((pin) => (
                 <PinMarker key={pin.id} pin={pin} onClick={handlePinClick} />
               ))}
             </div>
 
-            {/* Annotate mode banner */}
             {annotating && (
               <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-red-500/90 text-white text-xs px-3 py-1 rounded-full shadow-lg pointer-events-none z-30">
                 Click anywhere to drop a pin — Esc to exit
